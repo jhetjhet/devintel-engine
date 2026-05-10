@@ -52,7 +52,7 @@ class RedisHandler(logging.Handler):
 # Logging setup
 # ---------------------------------------------------------------------------
 
-def _setup_logging(redis_client: redis.Redis) -> None:
+def _setup_logging(redis_client: redis.Redis, channel: str = "devintel_engine") -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
@@ -63,8 +63,8 @@ def _setup_logging(redis_client: redis.Redis) -> None:
     )
     root_logger.addHandler(console)
 
-    # Redis handler — publishes to devaudt_logs channel
-    redis_handler = RedisHandler(redis_client, channel="devaudt_logs")
+    # Redis handler — publishes to devintel_engine channel
+    redis_handler = RedisHandler(redis_client, channel=channel)
     redis_handler.setFormatter(
         logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s")
     )
@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     # Redis connection (used for log streaming)
     r = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), port=6379, db=0)
-    _setup_logging(r)
+    _setup_logging(r, channel="devintel_engine_" + target_job_id)
 
     report = asyncio.run(run_audit(target_repo, target_job_id))
 
