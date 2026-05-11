@@ -60,6 +60,27 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Progress reporting (configured by orchestrator before graph invocation)
+# ---------------------------------------------------------------------------
+
+_progress_reporter = None
+
+
+def set_progress_reporter(fn) -> None:
+    """Register a progress callback: fn(percent: int, stage: str) -> None."""
+    global _progress_reporter
+    _progress_reporter = fn
+
+
+def _emit_progress(percent: int, stage: str) -> None:
+    if _progress_reporter is not None:
+        try:
+            _progress_reporter(percent, stage)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Fallback outputs — returned when an LLM node exhausts all retries
 # ---------------------------------------------------------------------------
 
@@ -99,6 +120,7 @@ def ingestor_node(state: AuditState) -> dict[str, Any]:
     This node produces only deterministic hard facts — no LLM involved.
     """
     logger.info("[Ingestor] Running Layer 1-4 engines for %s", state.repo_url)
+    _emit_progress(2, "ingestor_start")
 
     # Layer 1 — raw analysis
     audit_result = analyze_url(state.repo_url)
@@ -118,6 +140,7 @@ def ingestor_node(state: AuditState) -> dict[str, Any]:
         token_budget=8000,
     )
 
+    _emit_progress(25, "ingestor_done")
     return {
         "layers": LayerData(
             audit_result=audit_result.to_dict(),
@@ -147,12 +170,16 @@ async def _call_architect_llm(formatted_prompt: str, clusters_json: str) -> Arch
         "3. `confidence` — Float 0.0-1.0 reflecting your certainty.\n"
         "4. `architectural_recommendations` — 3-5 actionable structural improvements.\n"
     )
-    return await structured.ainvoke(prompt)
+    result = await structured.ainvoke(prompt)
+    if result is None:
+        raise ValueError("LLM returned no structured output for ArchitectOutput")
+    return result
 
 
 async def architect_node(state: AuditState) -> dict[str, Any]:
     """Async LLM node. Generates ai_reasoning and overall_verdict."""
     logger.info("[Architect] Starting architectural reasoning")
+    _emit_progress(26, "architect_start")
 
     context_packet: dict[str, Any] = state.layers.context_packet or {}
     correlation_report: dict[str, Any] = state.layers.correlation_report or {}
@@ -165,12 +192,14 @@ async def architect_node(state: AuditState) -> dict[str, Any]:
         result = await _call_architect_llm(formatted_prompt, clusters_json)
     except Exception as exc:
         logger.error("[Architect] All retries exhausted: %s", exc)
+        _emit_progress(55, "architect_done")
         return {
             "architect_output": _FALLBACK_ARCHITECT,
             "errors": [f"architect_node: {exc}"],
         }
 
     logger.info("[Architect] Verdict: %s (confidence=%.2f)", result.overall_verdict, result.confidence)
+    _emit_progress(55, "architect_done")
     return {"architect_output": result}
 
 
@@ -182,7 +211,10 @@ async def architect_node(state: AuditState) -> dict[str, Any]:
 async def _call_quantifier_llm(context: str) -> QuantifierOutput:
     llm = get_llm(temperature=0.1)
     structured = llm.with_structured_output(QuantifierOutput, method="function_calling")
-    return await structured.ainvoke(context)
+    result = await structured.ainvoke(context)
+    if result is None:
+        raise ValueError("LLM returned no structured output for QuantifierOutput")
+    return result
 
 
 async def quantifier_node(state: AuditState) -> dict[str, Any]:
@@ -192,6 +224,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
     them and derive composite scores.
     """
     logger.info("[Quantifier] Computing radar metrics")
+    _emit_progress(26, "quantifier_start")
 
     risk_report: dict[str, Any] = state.layers.risk_report or {}
     audit_result: dict[str, Any] = state.layers.audit_result or {}
@@ -238,6 +271,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
             for k, v in base_scores.items()
         ]
         overall = round(sum(m.score for m in fallback_metrics) / len(fallback_metrics))
+        _emit_progress(65, "quantifier_done")
         return {
             "quantifier_output": QuantifierOutput(
                 radar_metrics=fallback_metrics,
@@ -249,6 +283,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
         }
 
     logger.info("[Quantifier] Overall score: %d", result.overall_score)
+    _emit_progress(65, "quantifier_done")
     return {"quantifier_output": result}
 
 
@@ -262,11 +297,13 @@ def mapmaker_node(state: AuditState) -> dict[str, Any]:
     Groups risk profiles by directory and computes health scores.
     """
     logger.info("[Mapmaker] Computing file structure health")
+    _emit_progress(26, "mapmaker_start")
 
     risk_report: dict[str, Any] = state.layers.risk_report or {}
     profiles: list[dict[str, Any]] = risk_report.get("profiles", [])
 
     health = compute_file_structure_health(profiles)
+    _emit_progress(32, "mapmaker_done")
     return {"mapmaker_output": MapmakerOutput(file_structure_health=health)}
 
 
@@ -301,7 +338,10 @@ async def _call_refactor_llm(smell: dict[str, Any], formatted_prompt: str) -> Re
         "- `diff.before`: The problematic code (realistic pseudocode or real snippet).\n"
         "- `diff.after`: The refactored version.\n"
     )
-    return await structured.ainvoke(prompt)
+    result = await structured.ainvoke(prompt)
+    if result is None:
+        raise ValueError("LLM returned no structured output for RefactorLLMOutput")
+    return result
 
 
 async def refactor_node(state: AuditState) -> dict[str, Any]:
@@ -310,6 +350,7 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
     Generates refactor suggestions for the top N code smells from L1.
     """
     logger.info("[Refactor] Generating refactor suggestions")
+    _emit_progress(26, "refactor_start")
 
     audit_result: dict[str, Any] = state.layers.audit_result or {}
     context_packet: dict[str, Any] = state.layers.context_packet or {}
@@ -326,6 +367,7 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
         code_smells,
         key=lambda s: severity_order.get(normalise_severity(s.get("severity", "low")), 4),
     )[:5]
+    _smell_count = len(top_smells)
 
     suggestions: list[RefactorSuggestion] = []
     errors: list[str] = []
@@ -360,7 +402,12 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
             diff=llm_out.diff,
         )
         suggestions.append(suggestion)
+        _emit_progress(
+            26 + round(idx / max(_smell_count, 1) * 44),
+            f"refactor_{idx}_of_{_smell_count}",
+        )
 
+    _emit_progress(70, "refactor_done")
     logger.info("[Refactor] Generated %d suggestions", len(suggestions))
     return {
         "refactor_output": RefactorOutput(refactor_suggestions=suggestions),
@@ -379,6 +426,7 @@ def aggregator_node(state: AuditState) -> dict[str, Any]:
     The orchestrator injects the transport envelope (job_id, repo_url, etc.).
     """
     logger.info("[Aggregator] Assembling final report for job %s", state.job_id)
+    _emit_progress(90, "aggregator_start")
 
     audit_result: dict[str, Any] = state.layers.audit_result or {}
     risk_report: dict[str, Any] = state.layers.risk_report or {}
@@ -436,4 +484,5 @@ def aggregator_node(state: AuditState) -> dict[str, Any]:
         llm_insights.overall_score,
         llm_insights.overall_verdict,
     )
+    _emit_progress(95, "aggregator_done")
     return {"final_report": report}
