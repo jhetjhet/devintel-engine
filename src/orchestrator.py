@@ -7,9 +7,9 @@ Usage
 
 Environment variables required
 -------------------------------
-    DEEPSEEK_API_KEY   — DeepSeek API key
-    DEEPSEEK_BASE_URL  — (optional) override API base URL
-    LLM_MODEL          — (optional) model ID, default: deepseek-chat
+    LLM_API_KEY        — LLM provider API key
+    LLM_BASE_URL       — (optional) OpenAI-compatible base URL
+    LLM_MODEL          — (optional) model ID, default: gpt-4o-mini
     LLM_MAX_RETRIES    — (optional) retry attempts per LLM node, default: 3
     LLM_RETRY_BASE_S   — (optional) back-off base seconds, default: 2.0
 
