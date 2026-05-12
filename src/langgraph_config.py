@@ -3,9 +3,9 @@ LLM client initialisation and shared retry logic for the audit workflow.
 
 Environment variables
 ---------------------
-DEEPSEEK_API_KEY   : required — DeepSeek API key
-DEEPSEEK_BASE_URL  : optional — defaults to the official DeepSeek endpoint
-LLM_MODEL          : optional — model ID (default: deepseek-chat)
+LLM_API_KEY        : required — API key for the LLM provider
+LLM_BASE_URL       : optional — OpenAI-compatible base URL (default: https://api.openai.com/v1)
+LLM_MODEL          : optional — model ID (default: gpt-4o-mini)
 LLM_MAX_RETRIES    : optional — max retry attempts per node (default: 3)
 LLM_RETRY_BASE_S   : optional — base back-off seconds (default: 2.0)
 """
@@ -25,23 +25,23 @@ logger = logging.getLogger(__name__)
 # Constants / env-var resolution
 # ---------------------------------------------------------------------------
 
-_DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
-_DEEPSEEK_BASE_URL: str = os.environ.get(
-    "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
+_LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "")
+_LLM_BASE_URL: str = os.environ.get(
+    "LLM_BASE_URL", "https://api.openai.com/v1"
 )
-_LLM_MODEL: str = os.environ.get("LLM_MODEL", "deepseek-chat")
+_LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 _LLM_MAX_RETRIES: int = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 _LLM_RETRY_BASE_S: float = float(os.environ.get("LLM_RETRY_BASE_S", "2.0"))
 
 
 def _require_api_key() -> str:
     """Return the API key or raise early with a clear message."""
-    if not _DEEPSEEK_API_KEY:
+    if not _LLM_API_KEY:
         raise EnvironmentError(
-            "DEEPSEEK_API_KEY is not set. "
+            "LLM_API_KEY is not set. "
             "Export it before running the audit worker."
         )
-    return _DEEPSEEK_API_KEY
+    return _LLM_API_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -50,14 +50,14 @@ def _require_api_key() -> str:
 
 def get_llm(temperature: float = 0.2) -> ChatOpenAI:
     """
-    Return a ChatOpenAI instance pointing at DeepSeek's OpenAI-compatible
-    endpoint.  This is intentionally not a singleton so callers can request
-    different temperatures (e.g., Architect vs Refactor).
+    Return a ChatOpenAI-compatible instance. Targets any OpenAI-compatible
+    endpoint configured via LLM_BASE_URL.  This is intentionally not a
+    singleton so callers can request different temperatures.
     """
     return ChatOpenAI(
         model=_LLM_MODEL,
         api_key=_require_api_key(),
-        base_url=_DEEPSEEK_BASE_URL,
+        base_url=_LLM_BASE_URL,
         temperature=temperature,
     )
 
@@ -121,11 +121,11 @@ def with_retry(
 # ---------------------------------------------------------------------------
 
 LLM_PROVENANCE = {
-    "provider": "deepseek",
+    "provider": _LLM_BASE_URL,
     "model": _LLM_MODEL,
     "prompt_version": "prompt-refactor-v1",
 }
 
-# DeepSeek does not support the `json_schema` response_format.
+# Use function_calling for structured output — broadly supported across providers.
 # All `.with_structured_output()` calls must use method="function_calling".
 STRUCTURED_OUTPUT_METHOD = "function_calling"

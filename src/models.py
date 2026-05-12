@@ -135,8 +135,8 @@ class RefactorAnalysis(BaseModel):
 class RefactorLLMMeta(BaseModel):
     """LLM provenance metadata. [deterministic]."""
 
-    provider: str = Field(default="deepseek")
-    model: str = Field(default="deepseek-chat")
+    provider: str = Field(default="")
+    model: str = Field(default="")
     prompt_version: str = Field(default="prompt-refactor-v1")
 
 
