@@ -3,7 +3,7 @@ Entry point for the AI-powered repo audit worker.
 
 Usage
 -----
-    python orchestrator.py <repo_url>
+    python orchestrator.py <repo_url> <job_id> [commit_hash]
 
 Environment variables required
 -------------------------------
@@ -82,24 +82,25 @@ def _setup_logging(redis_client: redis.Redis, channel: str = "devintel_engine") 
 # Redis job state helpers
 # ---------------------------------------------------------------------------
 
-def _set_status(r: redis.Redis, job_id: str, status: str) -> None:
-    r.set(f"devintel:{job_id}:status", status)
+def _set_status(r: redis.Redis, job_id: str, commit_hash: str, status: str) -> None:
+    r.set(f"devintel:{job_id}:{commit_hash}:status", status)
 
 
-def _set_result(r: redis.Redis, job_id: str, payload: dict) -> None:
-    r.set(f"devintel:{job_id}:result", json.dumps(payload))
+def _set_result(r: redis.Redis, job_id: str, commit_hash: str, payload: dict) -> None:
+    r.set(f"devintel:{job_id}:{commit_hash}:result", json.dumps(payload))
 
 
 def _publish_terminal(
     r: redis.Redis,
     job_id: str,
     channel: str,
+    commit_hash: str,
     level: str,
     message: str,
 ) -> None:
     """Publish a terminal event and persist it so subscribers that miss the
     pub/sub message can still detect job completion by polling the key
-    ``devintel:<job_id>:terminal``.
+    ``devintel:<job_id>:<commit_hash>:terminal``.
     """
     event = json.dumps({
         "timestamp": utc_now_iso(),
@@ -109,7 +110,7 @@ def _publish_terminal(
         "is_terminal": True,
     })
     try:
-        r.set(f"devintel:{job_id}:terminal", event)
+        r.set(f"devintel:{job_id}:{commit_hash}:terminal", event)
         r.publish(channel, event)
     except Exception as exc:  # noqa: BLE001
         print(f"WARNING: failed to publish terminal event: {exc}", file=sys.stderr)
@@ -119,10 +120,11 @@ def _publish_progress(
     r: redis.Redis,
     job_id: str,
     channel: str,
+    commit_hash: str,
     percent: int,
     stage: str,
 ) -> None:
-    """Persist current progress to ``devintel:<job_id>:progress`` and publish
+    """Persist current progress to ``devintel:<job_id>:<commit_hash>:progress`` and publish
     a progress event on the job channel.  Subscribers can poll the key or
     listen on the channel; both carry ``progress_percent`` and ``progress_stage``.
     """
@@ -137,7 +139,7 @@ def _publish_progress(
     })
     try:
         pipe = r.pipeline()
-        pipe.set(f"devintel:{job_id}:progress", percent)
+        pipe.set(f"devintel:{job_id}:{commit_hash}:progress", percent)
         pipe.publish(channel, event)
         pipe.execute()
     except Exception as exc:  # noqa: BLE001
@@ -195,40 +197,62 @@ async def run_audit(repo_url: str, job_id: str) -> dict:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python orchestrator.py <repo_url> <job_id>", file=sys.stderr)
+        print("Usage: python orchestrator.py <repo_url> <job_id> [commit_hash]", file=sys.stderr)
         sys.exit(1)
 
     target_repo = sys.argv[1]
     target_job_id = sys.argv[2]
+    commit_hash_arg = sys.argv[3] if len(sys.argv) > 3 else None
 
     # Redis connection (used for log streaming and job state)
     r = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), port=6379, db=0)
     _setup_logging(r, channel="devintel_engine_" + target_job_id)
 
     # Wire per-node progress events into Redis
+    # If commit_hash is supplied as a CLI arg it is used immediately.
+    # Otherwise the "unknown" placeholder is used and keys are renamed after
+    # the audit completes and the real hash is extracted from the report.
     _job_channel = "devintel_engine_" + target_job_id
+    commit_hash = commit_hash_arg or "unknown"
     set_progress_reporter(
-        lambda pct, stage: _publish_progress(r, target_job_id, _job_channel, pct, stage)
+        lambda pct, stage: _publish_progress(r, target_job_id, _job_channel, commit_hash, pct, stage)
     )
 
-    _set_status(r, target_job_id, "progress")
+    _set_status(r, target_job_id, commit_hash, "progress")
     logger = logging.getLogger(__name__)
     try:
         report = asyncio.run(run_audit(target_repo, target_job_id))
     except Exception as exc:
-        _set_status(r, target_job_id, "error")
-        _set_result(r, target_job_id, {"job_id": target_job_id, "status": "error", "error": str(exc)})
+        _set_status(r, target_job_id, commit_hash, "error")
+        _set_result(r, target_job_id, commit_hash, {"job_id": target_job_id, "status": "error", "error": str(exc)})
         logger.error("Audit failed: %s", exc, exc_info=True)
         # Publish a terminal event so subscribers know the job is done
-        _publish_terminal(r, target_job_id, "devintel_engine_" + target_job_id, "ERROR", f"Audit failed: {exc}")
+        _publish_terminal(r, target_job_id, _job_channel, commit_hash, "ERROR", f"Audit failed: {exc}")
         sys.exit(1)
 
-    _set_status(r, target_job_id, "completed")
-    payload = {"full_audit_report": report}
-    _set_result(r, target_job_id, payload)
-    _publish_progress(r, target_job_id, "devintel_engine_" + target_job_id, 100, "completed")
-    # Publish a terminal event so subscribers know the job is done
-    _publish_terminal(r, target_job_id, "devintel_engine_" + target_job_id, "INFO", "Audit completed successfully.")
+    # If no commit_hash was provided upfront, extract it from the report.
+    if not commit_hash_arg:
+        commit_hash = (
+            report.get("deterministic_report", {})
+            .get("repository_summary", {})
+            .get("commit_hash", "unknown")
+        )
 
-    # Emit the dashboard-ready JSON to stdout
-    print(json.dumps(payload, indent=2))
+    payload = {"full_audit_report": report}
+    _set_status(r, target_job_id, commit_hash, "completed")
+    _set_result(r, target_job_id, commit_hash, payload)
+    _publish_progress(r, target_job_id, _job_channel, commit_hash, 100, "completed")
+    # Publish a terminal event so subscribers know the job is done
+    _publish_terminal(r, target_job_id, _job_channel, commit_hash, "INFO", "Audit completed successfully.")
+
+    # Rename keys written under "unknown" placeholder to the real commit hash
+    # (only needed when commit_hash was not provided as a CLI arg).
+    if not commit_hash_arg and commit_hash != "unknown":
+        for suffix in ("status", "progress"):
+            old_key = f"devintel:{target_job_id}:unknown:{suffix}"
+            new_key = f"devintel:{target_job_id}:{commit_hash}:{suffix}"
+            try:
+                if r.exists(old_key):
+                    r.rename(old_key, new_key)
+            except redis.ResponseError as exc:  # noqa: BLE001
+                logger.warning("Could not rename Redis key %s → %s: %s", old_key, new_key, exc)
