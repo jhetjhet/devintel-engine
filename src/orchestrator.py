@@ -82,6 +82,19 @@ def _setup_logging(redis_client: redis.Redis, channel: str = "devintel_engine") 
 # Redis job state helpers
 # ---------------------------------------------------------------------------
 
+def _clear_job_keys(r: redis.Redis, job_id: str, commit_hash: str) -> None:
+    """Delete all persisted state keys for a job before starting a fresh run."""
+    keys = [
+        f"devintel:{job_id}:{commit_hash}:status",
+        f"devintel:{job_id}:{commit_hash}:result",
+        f"devintel:{job_id}:{commit_hash}:terminal",
+        f"devintel:{job_id}:{commit_hash}:progress",
+    ]
+    existing = [k for k in keys if r.exists(k)]
+    if existing:
+        r.delete(*existing)
+
+
 def _set_status(r: redis.Redis, job_id: str, commit_hash: str, status: str) -> None:
     r.set(f"devintel:{job_id}:{commit_hash}:status", status)
 
@@ -218,6 +231,7 @@ if __name__ == "__main__":
         lambda pct, stage: _publish_progress(r, target_job_id, _job_channel, commit_hash, pct, stage)
     )
 
+    _clear_job_keys(r, target_job_id, commit_hash)
     _set_status(r, target_job_id, commit_hash, "progress")
     logger = logging.getLogger(__name__)
     try:
