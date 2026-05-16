@@ -29,7 +29,7 @@ import redis
 from graph import audit_graph
 from models import AuditState
 from nodes import set_progress_reporter
-from utils import utc_now_iso
+from utils import get_progress_message, utc_now_iso
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def _publish_progress(
         "timestamp": utc_now_iso(),
         "level": "INFO",
         "logger": __name__,
-        "message": f"[Progress] {stage}: {percent}%",
+        "message": get_progress_message(stage),
         "is_terminal": False,
         "progress_percent": percent,
         "progress_stage": stage,

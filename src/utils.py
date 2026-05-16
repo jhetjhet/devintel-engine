@@ -42,6 +42,51 @@ def utc_now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Progress reporting utilities (weighted band allocation)
+# ---------------------------------------------------------------------------
+
+# Node progress bands — must sum to 100
+# ingestor: 0-25, architect: 25-40, quantifier: 40-55,
+# mapmaker: 55-65, refactor: 65-85, aggregator: 85-100
+
+def scale_progress(percent: int, band_start: int, band_end: int) -> int:
+    """
+    Convert a node-local 0-100% value into a globally-scaled percentage
+    that sits within [band_start, band_end].
+
+    Example: scale_progress(50, 25, 40) -> 32
+    """
+    return int(round(band_start + (percent / 100.0) * (band_end - band_start)))
+
+
+def get_progress_message(stage: str) -> str:
+    """Map a stage key to a human-readable progress message."""
+    _MESSAGES: dict[str, str] = {
+        "ingestor_start": "Analyzing repository structure and dependencies...",
+        "ingestor_done": "Repository analysis complete.",
+        "architect_start": "Evaluating architectural patterns and design quality...",
+        "architect_done": "Architectural analysis complete.",
+        "quantifier_start": "Computing code quality metrics and radar scores...",
+        "quantifier_done": "Quality metrics analysis complete.",
+        "mapmaker_start": "Building file structure health map...",
+        "mapmaker_done": "File structure analysis complete.",
+        "refactor_start": "Generating refactoring suggestions...",
+        "refactor_done": "Refactoring suggestions ready.",
+        "aggregator_start": "Compiling final audit report...",
+        "aggregator_done": "Final report assembled.",
+        "completed": "Audit completed successfully.",
+    }
+    # Dynamic refactor loop stages: "refactor_1_of_5", "refactor_2_of_5", ...
+    if stage.startswith("refactor_") and "_of_" in stage:
+        try:
+            parts = stage.split("_")
+            return f"Generating refactor suggestions ({parts[1]}/{parts[3]} code smells)..."
+        except (IndexError, ValueError):
+            return "Generating refactoring suggestions..."
+    return _MESSAGES.get(stage, f"Progress: {stage}")
+
+
+# ---------------------------------------------------------------------------
 # File structure health (Mapmaker logic)
 # ---------------------------------------------------------------------------
 
