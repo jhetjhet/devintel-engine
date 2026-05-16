@@ -20,6 +20,7 @@ Output
     Structured logs are published to Redis channel `devintel_engine_<job_id>`.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -90,6 +91,7 @@ def _clear_job_keys(r: redis.Redis, job_id: str, commit_hash: str) -> None:
         f"devintel:{job_id}:{commit_hash}:result",
         f"devintel:{job_id}:{commit_hash}:terminal",
         f"devintel:{job_id}:{commit_hash}:progress",
+        f"devintel:{job_id}:{commit_hash}:metadata",
     ]
     existing = [k for k in keys if r.exists(k)]
     if existing:
@@ -117,6 +119,20 @@ def _get_redis_ttl_seconds() -> int:
     return ttl
 
 
+def _compute_expires_at(started_at_iso: str, ttl_seconds: int) -> str:
+    """Return expiration timestamp in ISO-8601 UTC with trailing Z."""
+    started_at = datetime.fromisoformat(started_at_iso.replace("Z", "+00:00"))
+    expires_at = started_at + timedelta(seconds=ttl_seconds)
+    return expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _compute_duration_ms(started_at_iso: str, ended_at_iso: str) -> int:
+    """Return elapsed milliseconds between two ISO-8601 timestamps."""
+    started_at = datetime.fromisoformat(started_at_iso.replace("Z", "+00:00"))
+    ended_at = datetime.fromisoformat(ended_at_iso.replace("Z", "+00:00"))
+    return int((ended_at - started_at).total_seconds() * 1000)
+
+
 def _set_status(
     r: redis.Redis,
     job_id: str,
@@ -135,6 +151,16 @@ def _set_result(
     ttl_seconds: int,
 ) -> None:
     r.set(f"devintel:{job_id}:{commit_hash}:result", json.dumps(payload), ex=ttl_seconds)
+
+
+def _set_metadata(
+    r: redis.Redis,
+    job_id: str,
+    commit_hash: str,
+    payload: dict,
+    ttl_seconds: int,
+) -> None:
+    r.set(f"devintel:{job_id}:{commit_hash}:metadata", json.dumps(payload), ex=ttl_seconds)
 
 
 def _publish_terminal(
@@ -264,6 +290,22 @@ if __name__ == "__main__":
     _job_channel = "devintel_engine_" + target_job_id
     commit_hash = commit_hash_arg or "unknown"
     redis_ttl_seconds = _get_redis_ttl_seconds()
+    started_at = utc_now_iso()
+    metadata = {
+        "job_id": target_job_id,
+        "repo_url": target_repo,
+        "commit_hash": commit_hash,
+        "commit_hash_source": "cli" if commit_hash_arg else "derived",
+        "channel": _job_channel,
+        "started_at": started_at,
+        "updated_at": started_at,
+        "expires_at": _compute_expires_at(started_at, redis_ttl_seconds),
+        "ttl_seconds": redis_ttl_seconds,
+        "status": "progress",
+        "terminal_published": False,
+        "completed_at": None,
+        "duration_ms": None,
+    }
     set_progress_reporter(
         lambda pct, stage: _publish_progress(
             r,
@@ -278,6 +320,7 @@ if __name__ == "__main__":
 
     _clear_job_keys(r, target_job_id, commit_hash)
     _set_status(r, target_job_id, commit_hash, "progress", redis_ttl_seconds)
+    _set_metadata(r, target_job_id, commit_hash, metadata, redis_ttl_seconds)
     logger = logging.getLogger(__name__)
     try:
         report = asyncio.run(run_audit(target_repo, target_job_id))
@@ -290,6 +333,18 @@ if __name__ == "__main__":
             {"job_id": target_job_id, "status": "error", "error": str(exc)},
             redis_ttl_seconds,
         )
+        metadata.update(
+            {
+                "commit_hash": commit_hash,
+                "updated_at": utc_now_iso(),
+                "status": "error",
+                "error": str(exc),
+                "terminal_published": True,
+                "completed_at": utc_now_iso(),
+            }
+        )
+        metadata["duration_ms"] = _compute_duration_ms(started_at, metadata["completed_at"])
+        _set_metadata(r, target_job_id, commit_hash, metadata, redis_ttl_seconds)
         logger.error("Audit failed: %s", exc, exc_info=True)
         # Publish a terminal event so subscribers know the job is done
         _publish_terminal(
@@ -323,6 +378,17 @@ if __name__ == "__main__":
         "completed",
         redis_ttl_seconds,
     )
+    metadata.update(
+        {
+            "commit_hash": commit_hash,
+            "updated_at": utc_now_iso(),
+            "status": "completed",
+            "terminal_published": True,
+            "completed_at": utc_now_iso(),
+        }
+    )
+    metadata["duration_ms"] = _compute_duration_ms(started_at, metadata["completed_at"])
+    _set_metadata(r, target_job_id, commit_hash, metadata, redis_ttl_seconds)
     # Publish a terminal event so subscribers know the job is done
     _publish_terminal(
         r,
@@ -337,7 +403,7 @@ if __name__ == "__main__":
     # Rename keys written under "unknown" placeholder to the real commit hash
     # (only needed when commit_hash was not provided as a CLI arg).
     if not commit_hash_arg and commit_hash != "unknown":
-        for suffix in ("status", "progress"):
+        for suffix in ("status", "progress", "metadata"):
             old_key = f"devintel:{target_job_id}:unknown:{suffix}"
             new_key = f"devintel:{target_job_id}:{commit_hash}:{suffix}"
             try:
