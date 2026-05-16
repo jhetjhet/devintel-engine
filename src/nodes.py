@@ -53,7 +53,9 @@ from utils import (
     extract_repository_summary,
     extract_security_audit,
     extract_top_risky_entities,
+    get_progress_message,
     normalise_severity,
+    scale_progress,
     utc_now_iso,
 )
 
@@ -64,16 +66,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _progress_reporter = None
+_progress_hwm: int = -1  # high-water mark — never go backward
 
 
 def set_progress_reporter(fn) -> None:
     """Register a progress callback: fn(percent: int, stage: str) -> None."""
-    global _progress_reporter
+    global _progress_reporter, _progress_hwm
     _progress_reporter = fn
+    _progress_hwm = -1  # reset for each new job
 
 
 def _emit_progress(percent: int, stage: str) -> None:
-    if _progress_reporter is not None:
+    global _progress_hwm
+    if _progress_reporter is not None and percent > _progress_hwm:
+        _progress_hwm = percent
         try:
             _progress_reporter(percent, stage)
         except Exception:
@@ -120,7 +126,7 @@ def ingestor_node(state: AuditState) -> dict[str, Any]:
     This node produces only deterministic hard facts — no LLM involved.
     """
     logger.info("[Ingestor] Running Layer 1-4 engines for %s", state.repo_url)
-    _emit_progress(2, "ingestor_start")
+    _emit_progress(scale_progress(0, 0, 25), "ingestor_start")
 
     # Layer 1 — raw analysis
     audit_result = analyze_url(state.repo_url)
@@ -140,7 +146,7 @@ def ingestor_node(state: AuditState) -> dict[str, Any]:
         token_budget=8000,
     )
 
-    _emit_progress(25, "ingestor_done")
+    _emit_progress(scale_progress(100, 0, 25), "ingestor_done")
     return {
         "layers": LayerData(
             audit_result=audit_result.to_dict(),
@@ -179,7 +185,7 @@ async def _call_architect_llm(formatted_prompt: str, clusters_json: str) -> Arch
 async def architect_node(state: AuditState) -> dict[str, Any]:
     """Async LLM node. Generates ai_reasoning and overall_verdict."""
     logger.info("[Architect] Starting architectural reasoning")
-    _emit_progress(26, "architect_start")
+    _emit_progress(scale_progress(0, 25, 40), "architect_start")
 
     context_packet: dict[str, Any] = state.layers.context_packet or {}
     correlation_report: dict[str, Any] = state.layers.correlation_report or {}
@@ -192,14 +198,14 @@ async def architect_node(state: AuditState) -> dict[str, Any]:
         result = await _call_architect_llm(formatted_prompt, clusters_json)
     except Exception as exc:
         logger.error("[Architect] All retries exhausted: %s", exc)
-        _emit_progress(55, "architect_done")
+        _emit_progress(scale_progress(100, 25, 40), "architect_done")
         return {
             "architect_output": _FALLBACK_ARCHITECT,
             "errors": [f"architect_node: {exc}"],
         }
 
     logger.info("[Architect] Verdict: %s (confidence=%.2f)", result.overall_verdict, result.confidence)
-    _emit_progress(55, "architect_done")
+    _emit_progress(scale_progress(100, 25, 40), "architect_done")
     return {"architect_output": result}
 
 
@@ -224,7 +230,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
     them and derive composite scores.
     """
     logger.info("[Quantifier] Computing radar metrics")
-    _emit_progress(26, "quantifier_start")
+    _emit_progress(scale_progress(0, 40, 55), "quantifier_start")
 
     risk_report: dict[str, Any] = state.layers.risk_report or {}
     audit_result: dict[str, Any] = state.layers.audit_result or {}
@@ -271,7 +277,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
             for k, v in base_scores.items()
         ]
         overall = round(sum(m.score for m in fallback_metrics) / len(fallback_metrics))
-        _emit_progress(65, "quantifier_done")
+        _emit_progress(scale_progress(100, 40, 55), "quantifier_done")
         return {
             "quantifier_output": QuantifierOutput(
                 radar_metrics=fallback_metrics,
@@ -283,7 +289,7 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
         }
 
     logger.info("[Quantifier] Overall score: %d", result.overall_score)
-    _emit_progress(65, "quantifier_done")
+    _emit_progress(scale_progress(100, 40, 55), "quantifier_done")
     return {"quantifier_output": result}
 
 
@@ -297,13 +303,13 @@ def mapmaker_node(state: AuditState) -> dict[str, Any]:
     Groups risk profiles by directory and computes health scores.
     """
     logger.info("[Mapmaker] Computing file structure health")
-    _emit_progress(26, "mapmaker_start")
+    _emit_progress(scale_progress(0, 55, 65), "mapmaker_start")
 
     risk_report: dict[str, Any] = state.layers.risk_report or {}
     profiles: list[dict[str, Any]] = risk_report.get("profiles", [])
 
     health = compute_file_structure_health(profiles)
-    _emit_progress(32, "mapmaker_done")
+    _emit_progress(scale_progress(100, 55, 65), "mapmaker_done")
     return {"mapmaker_output": MapmakerOutput(file_structure_health=health)}
 
 
@@ -350,7 +356,7 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
     Generates refactor suggestions for the top N code smells from L1.
     """
     logger.info("[Refactor] Generating refactor suggestions")
-    _emit_progress(26, "refactor_start")
+    _emit_progress(scale_progress(0, 65, 85), "refactor_start")
 
     audit_result: dict[str, Any] = state.layers.audit_result or {}
     context_packet: dict[str, Any] = state.layers.context_packet or {}
@@ -402,12 +408,13 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
             diff=llm_out.diff,
         )
         suggestions.append(suggestion)
+        local_pct = round(idx / max(_smell_count, 1) * 100)
         _emit_progress(
-            26 + round(idx / max(_smell_count, 1) * 44),
+            scale_progress(local_pct, 65, 85),
             f"refactor_{idx}_of_{_smell_count}",
         )
 
-    _emit_progress(70, "refactor_done")
+    _emit_progress(scale_progress(100, 65, 85), "refactor_done")
     logger.info("[Refactor] Generated %d suggestions", len(suggestions))
     return {
         "refactor_output": RefactorOutput(refactor_suggestions=suggestions),
@@ -426,7 +433,7 @@ def aggregator_node(state: AuditState) -> dict[str, Any]:
     The orchestrator injects the transport envelope (job_id, repo_url, etc.).
     """
     logger.info("[Aggregator] Assembling final report for job %s", state.job_id)
-    _emit_progress(90, "aggregator_start")
+    _emit_progress(scale_progress(0, 85, 100), "aggregator_start")
 
     audit_result: dict[str, Any] = state.layers.audit_result or {}
     risk_report: dict[str, Any] = state.layers.risk_report or {}
@@ -484,5 +491,5 @@ def aggregator_node(state: AuditState) -> dict[str, Any]:
         llm_insights.overall_score,
         llm_insights.overall_verdict,
     )
-    _emit_progress(95, "aggregator_done")
+    _emit_progress(scale_progress(100, 85, 100), "aggregator_done")
     return {"final_report": report}
