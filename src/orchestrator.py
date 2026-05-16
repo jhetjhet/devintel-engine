@@ -12,6 +12,7 @@ Environment variables required
     LLM_MODEL          — (optional) model ID, default: gpt-4o-mini
     LLM_MAX_RETRIES    — (optional) retry attempts per LLM node, default: 3
     LLM_RETRY_BASE_S   — (optional) back-off base seconds, default: 2.0
+    REDIS_TTL_SECONDS  — (optional) TTL for persisted job keys, default: 86400
 
 Output
 ------
@@ -95,12 +96,45 @@ def _clear_job_keys(r: redis.Redis, job_id: str, commit_hash: str) -> None:
         r.delete(*existing)
 
 
-def _set_status(r: redis.Redis, job_id: str, commit_hash: str, status: str) -> None:
-    r.set(f"devintel:{job_id}:{commit_hash}:status", status)
+def _get_redis_ttl_seconds() -> int:
+    """Return Redis key TTL in seconds, defaulting to 1 day."""
+    raw = os.environ.get("REDIS_TTL_SECONDS", "86400")
+    try:
+        ttl = int(raw)
+    except ValueError:
+        print(
+            f"WARNING: invalid REDIS_TTL_SECONDS={raw!r}; using default 86400",
+            file=sys.stderr,
+        )
+        return 86400
+
+    if ttl <= 0:
+        print(
+            f"WARNING: non-positive REDIS_TTL_SECONDS={ttl}; using default 86400",
+            file=sys.stderr,
+        )
+        return 86400
+    return ttl
 
 
-def _set_result(r: redis.Redis, job_id: str, commit_hash: str, payload: dict) -> None:
-    r.set(f"devintel:{job_id}:{commit_hash}:result", json.dumps(payload))
+def _set_status(
+    r: redis.Redis,
+    job_id: str,
+    commit_hash: str,
+    status: str,
+    ttl_seconds: int,
+) -> None:
+    r.set(f"devintel:{job_id}:{commit_hash}:status", status, ex=ttl_seconds)
+
+
+def _set_result(
+    r: redis.Redis,
+    job_id: str,
+    commit_hash: str,
+    payload: dict,
+    ttl_seconds: int,
+) -> None:
+    r.set(f"devintel:{job_id}:{commit_hash}:result", json.dumps(payload), ex=ttl_seconds)
 
 
 def _publish_terminal(
@@ -110,6 +144,7 @@ def _publish_terminal(
     commit_hash: str,
     level: str,
     message: str,
+    ttl_seconds: int,
 ) -> None:
     """Publish a terminal event and persist it so subscribers that miss the
     pub/sub message can still detect job completion by polling the key
@@ -123,7 +158,7 @@ def _publish_terminal(
         "is_terminal": True,
     })
     try:
-        r.set(f"devintel:{job_id}:{commit_hash}:terminal", event)
+        r.set(f"devintel:{job_id}:{commit_hash}:terminal", event, ex=ttl_seconds)
         r.publish(channel, event)
     except Exception as exc:  # noqa: BLE001
         print(f"WARNING: failed to publish terminal event: {exc}", file=sys.stderr)
@@ -136,6 +171,7 @@ def _publish_progress(
     commit_hash: str,
     percent: int,
     stage: str,
+    ttl_seconds: int,
 ) -> None:
     """Persist current progress to ``devintel:<job_id>:<commit_hash>:progress`` and publish
     a progress event on the job channel.  Subscribers can poll the key or
@@ -152,7 +188,7 @@ def _publish_progress(
     })
     try:
         pipe = r.pipeline()
-        pipe.set(f"devintel:{job_id}:{commit_hash}:progress", percent)
+        pipe.set(f"devintel:{job_id}:{commit_hash}:progress", percent, ex=ttl_seconds)
         pipe.publish(channel, event)
         pipe.execute()
     except Exception as exc:  # noqa: BLE001
@@ -227,21 +263,44 @@ if __name__ == "__main__":
     # the audit completes and the real hash is extracted from the report.
     _job_channel = "devintel_engine_" + target_job_id
     commit_hash = commit_hash_arg or "unknown"
+    redis_ttl_seconds = _get_redis_ttl_seconds()
     set_progress_reporter(
-        lambda pct, stage: _publish_progress(r, target_job_id, _job_channel, commit_hash, pct, stage)
+        lambda pct, stage: _publish_progress(
+            r,
+            target_job_id,
+            _job_channel,
+            commit_hash,
+            pct,
+            stage,
+            redis_ttl_seconds,
+        )
     )
 
     _clear_job_keys(r, target_job_id, commit_hash)
-    _set_status(r, target_job_id, commit_hash, "progress")
+    _set_status(r, target_job_id, commit_hash, "progress", redis_ttl_seconds)
     logger = logging.getLogger(__name__)
     try:
         report = asyncio.run(run_audit(target_repo, target_job_id))
     except Exception as exc:
-        _set_status(r, target_job_id, commit_hash, "error")
-        _set_result(r, target_job_id, commit_hash, {"job_id": target_job_id, "status": "error", "error": str(exc)})
+        _set_status(r, target_job_id, commit_hash, "error", redis_ttl_seconds)
+        _set_result(
+            r,
+            target_job_id,
+            commit_hash,
+            {"job_id": target_job_id, "status": "error", "error": str(exc)},
+            redis_ttl_seconds,
+        )
         logger.error("Audit failed: %s", exc, exc_info=True)
         # Publish a terminal event so subscribers know the job is done
-        _publish_terminal(r, target_job_id, _job_channel, commit_hash, "ERROR", f"Audit failed: {exc}")
+        _publish_terminal(
+            r,
+            target_job_id,
+            _job_channel,
+            commit_hash,
+            "ERROR",
+            f"Audit failed: {exc}",
+            redis_ttl_seconds,
+        )
         sys.exit(1)
 
     # If no commit_hash was provided upfront, extract it from the report.
@@ -253,11 +312,27 @@ if __name__ == "__main__":
         )
 
     payload = {"full_audit_report": report}
-    _set_status(r, target_job_id, commit_hash, "completed")
-    _set_result(r, target_job_id, commit_hash, payload)
-    _publish_progress(r, target_job_id, _job_channel, commit_hash, 100, "completed")
+    _set_status(r, target_job_id, commit_hash, "completed", redis_ttl_seconds)
+    _set_result(r, target_job_id, commit_hash, payload, redis_ttl_seconds)
+    _publish_progress(
+        r,
+        target_job_id,
+        _job_channel,
+        commit_hash,
+        100,
+        "completed",
+        redis_ttl_seconds,
+    )
     # Publish a terminal event so subscribers know the job is done
-    _publish_terminal(r, target_job_id, _job_channel, commit_hash, "INFO", "Audit completed successfully.")
+    _publish_terminal(
+        r,
+        target_job_id,
+        _job_channel,
+        commit_hash,
+        "INFO",
+        "Audit completed successfully.",
+        redis_ttl_seconds,
+    )
 
     # Rename keys written under "unknown" placeholder to the real commit hash
     # (only needed when commit_hash was not provided as a CLI arg).
