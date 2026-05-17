@@ -364,6 +364,7 @@ class AuditState(BaseModel):
     repo_url: str = ""
     job_id: str = ""
     timestamp: str = ""
+    enable_llm: bool = True
 
     # Layer data [deterministic] ---------------------------------------------
     layers: LayerData = Field(default_factory=LayerData)
