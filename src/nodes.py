@@ -187,6 +187,18 @@ async def architect_node(state: AuditState) -> dict[str, Any]:
     logger.info("[Architect] Starting architectural reasoning")
     _emit_progress(scale_progress(0, 25, 40), "architect_start")
 
+    if not state.enable_llm:
+        logger.info("[Architect] LLM disabled - returning empty insights")
+        _emit_progress(scale_progress(100, 25, 40), "architect_done")
+        return {
+            "architect_output": ArchitectOutput(
+                ai_reasoning="",
+                overall_verdict="",
+                confidence=0.0,
+                architectural_recommendations=[],
+            )
+        }
+
     context_packet: dict[str, Any] = state.layers.context_packet or {}
     correlation_report: dict[str, Any] = state.layers.correlation_report or {}
 
@@ -231,6 +243,18 @@ async def quantifier_node(state: AuditState) -> dict[str, Any]:
     """
     logger.info("[Quantifier] Computing radar metrics")
     _emit_progress(scale_progress(0, 40, 55), "quantifier_start")
+
+    if not state.enable_llm:
+        logger.info("[Quantifier] LLM disabled - returning empty score payload")
+        _emit_progress(scale_progress(100, 40, 55), "quantifier_done")
+        return {
+            "quantifier_output": QuantifierOutput(
+                radar_metrics=[],
+                overall_score=0,
+                technical_debt_score=0,
+                growth_points=0,
+            )
+        }
 
     risk_report: dict[str, Any] = state.layers.risk_report or {}
     audit_result: dict[str, Any] = state.layers.audit_result or {}
@@ -357,6 +381,14 @@ async def refactor_node(state: AuditState) -> dict[str, Any]:
     """
     logger.info("[Refactor] Generating refactor suggestions")
     _emit_progress(scale_progress(0, 65, 85), "refactor_start")
+
+    if not state.enable_llm:
+        logger.info("[Refactor] LLM disabled - returning no refactor suggestions")
+        _emit_progress(scale_progress(100, 65, 85), "refactor_done")
+        return {
+            "refactor_output": RefactorOutput(refactor_suggestions=[]),
+            "errors": [],
+        }
 
     audit_result: dict[str, Any] = state.layers.audit_result or {}
     context_packet: dict[str, Any] = state.layers.context_packet or {}

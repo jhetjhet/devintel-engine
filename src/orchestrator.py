@@ -7,7 +7,9 @@ Usage
 
 Environment variables required
 -------------------------------
-    LLM_API_KEY        — LLM provider API key
+    DEVINTEL_WITH_LLM  — (optional) true/false, 1/0, yes/no. Default: true
+                          Alias: DEVINTEL_LLM_ENABLED
+    LLM_API_KEY        — LLM provider API key (required only when LLM is enabled)
     LLM_BASE_URL       — (optional) OpenAI-compatible base URL
     LLM_MODEL          — (optional) model ID, default: gpt-4o-mini
     LLM_MAX_RETRIES    — (optional) retry attempts per LLM node, default: 3
@@ -225,7 +227,26 @@ def _publish_progress(
 # Main
 # ---------------------------------------------------------------------------
 
-async def run_audit(repo_url: str, job_id: str) -> dict:
+def _parse_with_llm_flag() -> bool:
+    """Resolve premium LLM mode from env with backward-compatible default."""
+    raw = os.environ.get("DEVINTEL_WITH_LLM")
+    if raw is None:
+        raw = os.environ.get("DEVINTEL_LLM_ENABLED", "true")
+
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+
+    print(
+        f"WARNING: invalid DEVINTEL_WITH_LLM={raw!r}; defaulting to true",
+        file=sys.stderr,
+    )
+    return True
+
+
+async def run_audit(repo_url: str, job_id: str, with_llm: bool) -> dict:
     """
     Invoke the LangGraph audit workflow and return the final report as a dict.
     """
@@ -233,10 +254,16 @@ async def run_audit(repo_url: str, job_id: str) -> dict:
         repo_url=repo_url,
         job_id=job_id,
         timestamp=utc_now_iso(),
+        enable_llm=with_llm,
     )
 
     logger = logging.getLogger(__name__)
-    logger.info("Starting audit — job_id=%s, repo=%s", initial_state.job_id, repo_url)
+    logger.info(
+        "Starting audit - job_id=%s, repo=%s, with_llm=%s",
+        initial_state.job_id,
+        repo_url,
+        with_llm,
+    )
 
     try:
         raw: dict = await audit_graph.ainvoke(initial_state)
@@ -288,6 +315,7 @@ if __name__ == "__main__":
     # Otherwise the "unknown" placeholder is used and keys are renamed after
     # the audit completes and the real hash is extracted from the report.
     _job_channel = "devintel_engine_" + target_job_id
+    with_llm = _parse_with_llm_flag()
     commit_hash = commit_hash_arg or "unknown"
     redis_ttl_seconds = _get_redis_ttl_seconds()
     started_at = utc_now_iso()
@@ -302,6 +330,8 @@ if __name__ == "__main__":
         "expires_at": _compute_expires_at(started_at, redis_ttl_seconds),
         "ttl_seconds": redis_ttl_seconds,
         "status": "progress",
+        "with_llm": with_llm,
+        "llm_mode": "enabled" if with_llm else "disabled",
         "terminal_published": False,
         "completed_at": None,
         "duration_ms": None,
@@ -323,7 +353,7 @@ if __name__ == "__main__":
     _set_metadata(r, target_job_id, commit_hash, metadata, redis_ttl_seconds)
     logger = logging.getLogger(__name__)
     try:
-        report = asyncio.run(run_audit(target_repo, target_job_id))
+        report = asyncio.run(run_audit(target_repo, target_job_id, with_llm))
     except Exception as exc:
         _set_status(r, target_job_id, commit_hash, "error", redis_ttl_seconds)
         _set_result(

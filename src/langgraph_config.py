@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 # Constants / env-var resolution
 # ---------------------------------------------------------------------------
 
-_LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "")
 _LLM_BASE_URL: str = os.environ.get(
     "LLM_BASE_URL", "https://api.openai.com/v1"
 )
@@ -36,12 +35,13 @@ _LLM_RETRY_BASE_S: float = float(os.environ.get("LLM_RETRY_BASE_S", "2.0"))
 
 def _require_api_key() -> str:
     """Return the API key or raise early with a clear message."""
-    if not _LLM_API_KEY:
+    api_key = os.environ.get("LLM_API_KEY", "")
+    if not api_key:
         raise EnvironmentError(
             "LLM_API_KEY is not set. "
             "Export it before running the audit worker."
         )
-    return _LLM_API_KEY
+    return api_key
 
 
 # ---------------------------------------------------------------------------
